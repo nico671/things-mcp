@@ -1,5 +1,8 @@
+from things import mcp
+
+
 def main():
-    print("Hello from things-mcp!")
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

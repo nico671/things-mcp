@@ -1,12 +1,21 @@
+import asyncio
+import secrets
+from contextlib import suppress
 from typing import Annotated
 from urllib.parse import quote, urlencode
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, Field
 
-mcp = MCPServer("things-mcp")
+from callbacks import CallbackResult, CallbackState, callback_lifespan
+
+mcp = MCPServer("things-mcp", lifespan=callback_lifespan)
 
 THINGS_ADD_BASE_URL = "things:///add?"
+CALLBACK_TIMEOUT_SECONDS = 30
+OPEN_TIMEOUT_SECONDS = 5
 
 
 class AddPayload(BaseModel):
@@ -62,3 +71,72 @@ def build_add_url(payload: AddPayload) -> str:
     if "checklist-items" in params:
         params["checklist-items"] = "\n".join(params["checklist-items"])
     return THINGS_ADD_BASE_URL + urlencode(params, quote_via=quote)
+
+
+async def execute_url(url: str, callbacks: CallbackState) -> CallbackResult:
+    """Open an internally built Things URL and wait for its callback."""
+    request_id = secrets.token_urlsafe(24)
+    future = asyncio.get_running_loop().create_future()
+    callbacks.pending[request_id] = future
+    callback_urls = {
+        f"x-{outcome}": f"{callbacks.base_url}/callbacks/{request_id}/{outcome}"
+        for outcome in ("success", "error", "cancel")
+    }
+    separator = "&" if "?" in url else "?"
+    command_url = url + separator + urlencode(callback_urls, quote_via=quote)
+    process = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "/usr/bin/open",
+            command_url,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(process.wait(), timeout=OPEN_TIMEOUT_SECONDS)
+        if process.returncode != 0:
+            raise ToolError(
+                f"macOS could not open the Things URL (exit code {process.returncode})."
+            )
+        return await asyncio.wait_for(future, timeout=CALLBACK_TIMEOUT_SECONDS)
+    except TimeoutError as exc:
+        raise ToolError(
+            "Timed out waiting for Things. The command outcome is unknown; "
+            "do not retry automatically."
+        ) from exc
+    except OSError as exc:
+        raise ToolError("Could not start the macOS Things URL handler.") from exc
+    finally:
+        callbacks.pending.pop(request_id, None)
+        if not future.done():
+            future.cancel()
+        if process is not None and process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
+
+
+@mcp.tool()
+async def add_todo(payload: AddPayload, ctx: Context[CallbackState]) -> dict[str, str]:
+    """Create one Things to-do and return its ID after Things confirms success.
+
+    Only title is required. A timeout leaves the outcome unknown, so do not retry
+    automatically: Things may already have created the to-do.
+    """
+    result = await execute_url(
+        build_add_url(payload), ctx.request_context.lifespan_context
+    )
+    if result.outcome == "error":
+        code = result.parameters.get("errorCode", "unknown")
+        message = result.parameters.get(
+            "errorMessage", "No error message was supplied."
+        )
+        raise ToolError(f"Things error {code}: {message}")
+    if result.outcome == "cancel":
+        raise ToolError("Things canceled the request.")
+    todo_id = result.parameters.get("x-things-id", "").strip()
+    if not todo_id:
+        raise ToolError(
+            "Things reported success without a to-do ID. The outcome cannot be "
+            "verified; do not retry automatically."
+        )
+    return {"id": todo_id}
