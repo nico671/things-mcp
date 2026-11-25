@@ -10,6 +10,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, Field
 
 from callbacks import CallbackResult, CallbackState, callback_lifespan
+from read_models import SearchRequest, SearchResult
+from reads import search
 
 mcp = MCPServer("things-mcp", lifespan=callback_lifespan)
 
@@ -140,3 +142,17 @@ async def add_todo(payload: AddPayload, ctx: Context[CallbackState]) -> dict[str
             "verified; do not retry automatically."
         )
     return {"id": todo_id}
+
+
+@mcp.tool()
+async def search_todos(payload: SearchRequest) -> SearchResult:
+    """Search Things to-dos through the bundled read-only AppleScript.
+
+    Supplied scope constraints always apply. Detailed filters and query use any/OR
+    by default; choose match=all for AND. Canceled items are excluded unless a
+    status=canceled filter is supplied. Use scope.list_name="Today" to read
+    the native Today collection in its displayed order. There is no 500-item
+    cap. Check unavailable_fields: heading/checklist search and some schedule
+    details are not available through this reader yet.
+    """
+    return await search(payload)
